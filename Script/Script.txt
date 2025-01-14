@@ -1,0 +1,185 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from tkinter import Tk, Button, filedialog, Label, Entry, Frame, ttk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+class TEMParticleAnalyzer:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("TEM Particle Analyzer")
+
+        self.load_button = Button(root, text="Load Image", command=self.load_image)
+        self.load_button.pack()
+
+        self.pixel_size_label = Label(root, text="Pixel size (nm):")
+        self.pixel_size_label.pack()
+
+        self.pixel_size_entry = Entry(root)
+        self.pixel_size_entry.pack()
+
+        self.process_button = Button(root, text="Process Image", command=self.process_image, state='disabled')
+        self.process_button.pack()
+
+        self.export_button = Button(root, text="Export Data", command=self.export_data, state='disabled')
+        self.export_button.pack()
+
+        self.image_display_frame = Frame(root)
+        self.image_display_frame.pack(side='top', fill='both', expand=True)
+
+        self.image_figure = plt.Figure(figsize=(8, 4), dpi=100)
+        self.ax_original = self.image_figure.add_subplot(1, 2, 1)
+        self.ax_masked = self.image_figure.add_subplot(1, 2, 2)
+        self.image_canvas = FigureCanvasTkAgg(self.image_figure, master=self.image_display_frame)
+        self.image_canvas.get_tk_widget().pack(side='top', fill='both', expand=True)
+
+        self.main_frame = Frame(root)
+        self.main_frame.pack(side='bottom', fill='both', expand=True)
+
+        self.histogram_frame = Frame(self.main_frame)
+        self.histogram_frame.pack(side='left', fill='both', expand=True)
+
+        self.figure = plt.Figure(figsize=(5,4), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, self.histogram_frame)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        self.table_frame = Frame(self.main_frame)
+        self.table_frame.pack(side='right', fill='both', expand=True)
+
+        self.tree = ttk.Treeview(self.table_frame, columns=('Bin Range', 'Count'), show='headings')
+        self.tree.heading('Bin Range', text='Bin Range (nm)')
+        self.tree.heading('Count', text='Count')
+        self.tree.pack(side='left', fill='both', expand=True)
+
+        self.scrollbar = ttk.Scrollbar(self.table_frame, orient='vertical', command=self.tree.yview)
+        self.scrollbar.pack(side='right', fill='y')
+        self.tree.configure(yscrollcommand=self.scrollbar.set)
+
+        self.status_label = Label(root, text="")
+        self.status_label.pack()
+
+        self.canvas.mpl_connect('motion_notify_event', self.hover_histogram)
+
+        self.image = None
+        self.binary_image = None
+        self.particle_sizes_nm = []
+        self.bin_edges = []
+        self.counts = []
+
+    def load_image(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.tif")])
+        if file_path:
+            self.image = cv2.imread(file_path, 0)
+            self.process_button.config(state='active')
+            self.ax_original.imshow(self.image, cmap='gray')
+            self.ax_original.set_title('Original Image')
+            self.ax_original.axis('off')
+            self.image_figure.tight_layout()
+            self.image_canvas.draw()
+            self.show_image(self.image, title="Original Image")
+
+    def process_image(self):
+        pixel_size_str = self.pixel_size_entry.get()
+        try:
+            pixel_size = float(pixel_size_str)
+            if pixel_size <= 0:
+                raise ValueError
+        except ValueError:
+            print("Invalid pixel size. Please enter a positive number.")
+            return
+
+        if self.image is None:
+            return
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(self.image)
+        _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = np.ones((3,3), np.uint8)
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        self.ax_masked.imshow(opening, cmap='gray')
+        self.ax_masked.set_title('Masked Image')
+        self.ax_masked.axis('off')
+        self.image_figure.tight_layout()
+        self.image_canvas.draw()
+
+        contours, _ = cv2.findContours(opening, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.particle_sizes_nm = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > 10:
+                eq_diameter_pixels = np.sqrt(4*area/np.pi)
+                eq_diameter_nm = eq_diameter_pixels * float(pixel_size_str)
+                self.particle_sizes_nm.append(eq_diameter_nm)
+
+        if self.particle_sizes_nm:
+            median = np.median(self.particle_sizes_nm)
+            mad = np.median(np.abs(self.particle_sizes_nm - median))
+            threshold = 3
+            lower_bound = median - threshold * mad
+            upper_bound = median + threshold * mad
+            filtered_sizes = [size for size in self.particle_sizes_nm if lower_bound <= size <= upper_bound]
+        else:
+            filtered_sizes = []
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        self.counts, self.bin_edges, _ = ax.hist(filtered_sizes, edgecolor='black')
+        ax.set_xticks(ax.get_xticks())
+        ax.set_title('Particle Size Histogram')
+        ax.set_xlabel('Equivalent Diameter (nm)')
+        ax.set_ylabel('Frequency')
+        self.canvas.draw()
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for i in range(len(self.counts)):
+            bin_min = self.bin_edges[i]
+            bin_max = self.bin_edges[i+1]
+            self.tree.insert('', 'end', values=(f"{bin_min:.2f} - {bin_max:.2f}", int(self.counts[i])))
+
+        self.export_button.config(state='active')
+
+    def export_data(self):
+        if not hasattr(self, 'bin_edges') or not hasattr(self, 'counts'):
+            print("No data to export.")
+            return
+
+        bin_ranges = [f"{self.bin_edges[i]:.2f} - {self.bin_edges[i+1]:.2f}" for i in range(len(self.counts))]
+        data = {'Bin Range (nm)': bin_ranges, 'Count': self.counts}
+        df = pd.DataFrame(data)
+
+        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if file_path:
+            df.to_csv(file_path, index=False)
+            print(f"Data exported to {file_path}")
+
+    def hover_histogram(self, event):
+        if event.inaxes is not None:
+            x = event.xdata
+            if x is not None and self.bin_edges:
+                bin_idx = np.digitize(x, self.bin_edges) - 1
+                if 0 <= bin_idx < len(self.bin_edges)-1:
+                    bin_min = self.bin_edges[bin_idx]
+                    bin_max = self.bin_edges[bin_idx+1]
+                    sizes_in_bin = [size for size in self.particle_sizes_nm if bin_min <= size < bin_max]
+                    if sizes_in_bin:
+                        self.status_label.config(text=f"Sizes in this bin: {', '.join(map(str, sizes_in_bin))} nm")
+                    else:
+                        self.status_label.config(text="No particles in this bin.")
+                else:
+                    self.status_label.config(text="Hover over a valid bin.")
+            else:
+                self.status_label.config(text="Hover over the histogram.")
+        else:
+            self.status_label.config(text="")
+
+    def show_image(self, img, title="Image"):
+        cv2.imshow(title, img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    root = Tk()
+    app = TEMParticleAnalyzer(root)
+    root.mainloop()
